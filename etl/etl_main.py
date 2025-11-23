@@ -1,116 +1,144 @@
 """
-Land Registry Price Paid ETL
-- Downloads official pp-complete.txt dataset
-- Cleans & aggregates weekly transactions by Local Authority
-- Computes rolling 4 & 12 week totals
-- Publishes results to Google Sheets
-- Designed for GitHub Actions automation
+UK Housing ETL Pipeline — Land Registry Price Paid Data
+
+✅ Downloads official pp-complete.txt dataset
+✅ Cleans transaction records
+✅ Aggregates by week & local authority
+✅ Calculates rolling 4- and 12-week totals
+✅ Publishes output to Google Sheets
+✅ Runs automated in GitHub Actions
 """
 
-# ---- Standard library imports ----
-import os                            # read environment variables like GOOGLE_SHEET_ID, GCP_SA_JSON
-import io                            # convert downloaded text into file-like stream for pandas
-import json                          # decode GCP service account JSON
-from datetime import datetime        # timestamp logging
+# -------------------------
+# IMPORTS
+# -------------------------
 
-# ---- Third-party imports ----
-import requests                      # download TXT file over HTTP
-import pandas as pd                 # data processing, aggregation, rolling windows
-import numpy as np                  # numeric helpers (nunique, NaN handling)
+import os                                # Used to read environment variables in GitHub Actions
+import io                                # Converts downloaded text into in-memory file stream
+import json                              # Decodes GCP service account JSON
+from datetime import datetime            # Logging timestamps
 
-# ---- Google Sheets imports ----
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+import requests                           # HTTP download of dataset
+import pandas as pd                      # Data processing
+import numpy as np                       # Numeric operations
 
-# ---- CONSTANTS ----
+from google.oauth2.service_account import Credentials  # Auth for Google Sheets API
+from googleapiclient.discovery import build            # Interacts with Sheets API
 
-# ✅ ONLY WORKING RELIABLE SOURCE — TXT format
-# DO NOT replace with CSV URLs — they intermittently return HTML or empty files
+
+# -------------------------
+# CONSTANTS — CONFIGURATION
+# -------------------------
+
+# ✅ ONLY DATA SOURCE — DO NOT CHANGE
 LAND_REGISTRY_TXT_URL = (
     "http://prod.publicdata.landregistry.gov.uk.s3-website-eu-west-1.amazonaws.com/pp-complete.txt"
 )
 
-# Google Sheet ID is securely injected via GitHub secret
+# ✅ Spreadsheet ID stored securely in GitHub Actions → Settings → Secrets → GOOGLE_SHEET_ID
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
-# Required API scopes for editing Google Sheets
+# Required OAuth permission scope — allows writing to spreadsheets
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
-# ---- 1) DOWNLOAD TXT FILE ----
+# -------------------------
+# 1) DOWNLOAD DATASET
+# -------------------------
+
 def download_land_registry_txt():
     """
-    Downloads the official pp-complete.txt dataset.
-    TXT format is comma-separated, same as CSV but more reliable for automation.
-    Returns DataFrame or raises RuntimeError upon failure.
+    Downloads the pp-complete.txt dataset directly from HM Land Registry’s S3 bucket.
+    This file is comma-delimited and behaves like CSV, but is far more reliable than the
+    public CSV endpoints — which sometimes return empty responses.
+
+    Returns:
+        pandas.DataFrame — full unprocessed transaction dataset
+
+    Raises:
+        RuntimeError — if download fails or file cannot be parsed
     """
     print(f"📥 Downloading Land Registry TXT from {LAND_REGISTRY_TXT_URL} ...")
 
     try:
-        # request full dataset — allow long timeout because file is large
+        # Requests file — timeout increased because dataset is large (~7M rows)
         response = requests.get(LAND_REGISTRY_TXT_URL, timeout=300)
-        response.raise_for_status()  # fail if not HTTP 200
+        response.raise_for_status()  # Immediately fail if HTTP 4XX/5XX
 
-        # decode file safely — ignore weird UTF-8 artifacts instead of erroring
-        text = response.content.decode("utf-8", errors="ignore")
+        # Decode as UTF-8 and ignore weird encoding characters instead of crashing
+        text_data = response.content.decode("utf-8", errors="ignore")
 
-        # ensure non-empty file
-        if not text.strip():
+        # Prevent silently accepting empty text responses
+        if not text_data.strip():
             raise RuntimeError("Downloaded TXT file is empty.")
 
-        # read TXT into pandas — treat as CSV because it's comma-delimited
+        # Parse TXT as CSV because it is comma-separated
         df = pd.read_csv(
-            io.StringIO(text),
+            io.StringIO(text_data),
             sep=",",
-            low_memory=False,
-            skip_blank_lines=True
+            low_memory=False,        # Avoid dtype warnings for large file
+            skip_blank_lines=True     # Skip random blank rows
         )
 
-        # verify parsing worked
+        # Validate successful parsing
         if df.empty or len(df.columns) == 0:
-            raise RuntimeError("TXT file downloaded but contains no valid data.")
+            raise RuntimeError("TXT file parsed but contains no usable columns.")
 
-        print(f"✅ Successfully loaded {len(df):,} rows.")
+        print(f"✅ Successfully loaded {len(df):,} records.")
         return df
 
     except Exception as e:
         raise RuntimeError(f"❌ Failed to download or parse TXT dataset: {e}")
 
 
-# ---- 2) CLEAN + WEEKLY AGGREGATION ----
+# -------------------------
+# 2) CLEAN & PREPARE DATA
+# -------------------------
+
 def prepare_transactions(df_raw):
     """
-    Converts raw transaction-level dataset into weekly counts per Local Authority.
+    Standardizes, cleans, and maps transaction data.
+    Generates weekly transaction counts by Local Authority.
+
+    Returns:
+        pandas.DataFrame — weekly transaction totals
     """
 
     df = df_raw.copy()
 
-    # Identify date column dynamically — column names vary slightly over years
+    # Automatically find the transaction date column — names vary by year
     date_col = next((c for c in df.columns if "date" in c.lower()), None)
     if not date_col:
-        raise RuntimeError("No date column found — cannot continue ETL.")
+        raise RuntimeError("Transaction date column not found.")
 
-    # convert date strings → datetime
+    # Convert date strings → datetime objects
     df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df.dropna(subset=["date"])
+    df = df.dropna(subset=["date"])  # Remove rows without valid dates
 
-    # Find postcode column (for grouping)
+    # Identify postcode column if present
     pc_col = next((c for c in df.columns if "postcode" in c.lower()), None)
-    if pc_col:
-        df["postcode"] = df[pc_col].astype(str).str.replace(r"\s+", "", regex=True).str.upper()
-    else:
-        df["postcode"] = None
 
-    # Assign synthetic transaction ID if none exists — needed for counting
+    # Standardize postcodes — uppercase + remove spaces
+    if pc_col:
+        df["postcode"] = (
+            df[pc_col]
+            .astype(str)
+            .str.replace(r"\s+", "", regex=True)
+            .str.upper()
+        )
+    else:
+        df["postcode"] = None  # Continue so data still processes
+
+    # Create unique transaction ID if dataset doesn't provide one
     df["transaction_id"] = np.arange(len(df))
 
-    # In absence of official LA mapping, approximate using first 4 postcode chars
+    # Approximate local authority via first 4 postcode characters
     df["local_authority"] = df["postcode"].str[:4]
 
-    # Convert dates to week start (Mon)
+    # Convert date → Monday week start
     df["week"] = df["date"].dt.to_period("W").apply(lambda r: r.start_time)
 
-    # Weekly unique transaction counts per LA
+    # Weekly transaction counts per area
     weekly = (
         df.groupby(["week", "local_authority"])
         .agg(transactions=("transaction_id", "nunique"))
@@ -121,103 +149,138 @@ def prepare_transactions(df_raw):
     return weekly
 
 
-# ---- 3) CREATE ROLLING WINDOWS ----
+# -------------------------
+# 3) ROLLING TREND ANALYSIS
+# -------------------------
+
 def compute_rolling_windows(weekly_df, windows=[4, 12]):
     """
-    Produces rolling transaction totals for configurable week windows.
-    Example result: 4-week & 12-week trend indicators.
+    Computes rolling summed transaction counts over multiple week windows.
+
+    Args:
+        weekly_df — grouped weekly dataset
+        windows — list of window lengths (in weeks)
+
+    Returns:
+        pandas.DataFrame — long-format rolling trend dataset
     """
 
     weekly_df["week"] = pd.to_datetime(weekly_df["week"])
+
+    # Unique list of tracked local authorities
     local_areas = weekly_df["local_authority"].unique()
 
-    # build complete weekly timeline — ensures missing weeks fill with 0
-    all_weeks = pd.date_range(
-        weekly_df["week"].min(), weekly_df["week"].max(), freq="W-MON"
+    # Generate full weekly calendar — prevents missing-week gaps
+    week_range = pd.date_range(
+        weekly_df["week"].min(),
+        weekly_df["week"].max(),
+        freq="W-MON"
     )
 
-    # create full week × LA matrix
+    # Create full matrix of week × local authority
     expanded = (
-        pd.MultiIndex.from_product([all_weeks, local_areas], names=["week", "local_authority"])
+        pd.MultiIndex.from_product([week_range, local_areas], names=["week", "local_authority"])
         .to_frame(index=False)
         .merge(weekly_df, on=["week", "local_authority"], how="left")
         .fillna({"transactions": 0})
         .sort_values(["local_authority", "week"])
     )
 
-    outputs = []
+    trend_outputs = []
 
+    # Compute each rolling window separately
     for w in windows:
         temp = expanded.copy()
-        temp["rolling_trans"] = (
+        temp["rolling_transactions"] = (
             temp.groupby("local_authority")["transactions"]
             .transform(lambda s: s.rolling(w, min_periods=1).sum())
         )
         temp["window_weeks"] = w
-        outputs.append(temp)
+        trend_outputs.append(temp)
 
-    return pd.concat(outputs, ignore_index=True)
+    return pd.concat(trend_outputs, ignore_index=True)
 
 
-# ---- 4) WRITE RESULTS TO GOOGLE SHEETS ----
+# -------------------------
+# 4) WRITE TO GOOGLE SHEETS
+# -------------------------
+
 def write_to_google_sheets(dfs, gcp_json):
     """
-    Writes multiple DataFrames to separate tabs in a Google Sheet.
+    Uploads multiple DataFrames to Google Sheets — one tab per dataset.
+
+    Args:
+        dfs — dict: {"tab_name": dataframe}
+        gcp_json — decoded service account JSON
     """
 
+    # Authenticate using credentials stored in GitHub Secret
     creds = Credentials.from_service_account_info(gcp_json, scopes=SCOPES)
     service = build("sheets", "v4", credentials=creds)
     sheet = service.spreadsheets()
 
-    for tab, df in dfs.items():
-        values = [df.columns.tolist()] + df.astype(str).replace({np.nan: ""}).values.tolist()
+    for tab_name, df in dfs.items():
 
-        # clear sheet tab first to avoid leftovers
+        # Convert DataFrame → list-of-lists for Sheets API
+        rows = [df.columns.tolist()] + df.astype(str).replace({np.nan: ""}).values.tolist()
+
+        # Clear existing tab contents to avoid mismatched row counts
         sheet.values().clear(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=tab
+            range=tab_name
         ).execute()
 
-        # upload new data
+        # Upload new data
         sheet.values().update(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{tab}!A1",
+            range=f"{tab_name}!A1",
             valueInputOption="RAW",
-            body={"values": values}
+            body={"values": rows}
         ).execute()
 
 
-# ---- 5) MAIN ETL ORCHESTRATION ----
+# -------------------------
+# 5) MAIN ETL EXECUTION
+# -------------------------
+
 def main():
-    print(f"🚀 ETL start {datetime.utcnow().isoformat()}")
+    """ Master pipeline — runs entire ETL process """
+    print(f"🚀 ETL started {datetime.utcnow().isoformat()}")
 
+    # Step 1 — Download raw dataset
     df_raw = download_land_registry_txt()
+
+    # Step 2 — Create weekly transaction dataset
     weekly = prepare_transactions(df_raw)
-    windows = compute_rolling_windows(weekly)
-    latest = windows[windows["week"] == windows["week"].max()].copy()
 
-    # load service account JSON from GitHub Actions secret
-    gcp_sa = os.environ.get("GCP_SA_JSON")
-    if not gcp_sa:
-        raise RuntimeError("Missing GCP_SA_JSON — add it to GitHub Secrets.")
+    # Step 3 — Create rolling trend analysis
+    rolling = compute_rolling_windows(weekly)
 
-    gcp_json = json.loads(gcp_sa)
+    # Step 4 — Extract most recent week snapshot
+    latest = rolling[rolling["week"] == rolling["week"].max()].copy()
+
+    # Load Google Auth service account from GitHub Secret
+    gcp_env = os.environ.get("GCP_SA_JSON")
+    if not gcp_env:
+        raise RuntimeError("Missing GCP_SA_JSON secret in GitHub Actions.")
+    gcp_json = json.loads(gcp_env)
 
     if not GOOGLE_SHEET_ID:
-        raise RuntimeError("Missing GOOGLE_SHEET_ID — add it to GitHub Secrets.")
+        raise RuntimeError("Missing GOOGLE_SHEET_ID secret.")
 
+    # Step 5 — Upload results to Sheets
     write_to_google_sheets(
         {
             "weekly_by_la": weekly,
-            "rolling_windows": windows,
+            "rolling_windows": rolling,
             "latest_snapshot": latest,
         },
-        gcp_json,
+        gcp_json
     )
 
-    print(f"✅ ETL finished {datetime.utcnow().isoformat()}")
+    print(f"✅ ETL completed {datetime.utcnow().isoformat()}")
 
 
-# ---- Execute only when run directly ----
+# Run pipeline when executed directly
 if __name__ == "__main__":
     main()
