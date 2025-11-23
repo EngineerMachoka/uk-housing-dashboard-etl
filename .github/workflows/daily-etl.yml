@@ -1,47 +1,36 @@
 # .github/workflows/daily-etl.yml
-# GitHub Actions workflow to run the UK Price Paid ETL daily
-# Fully annotated
-
 name: Daily Land Registry ETL
 
-# Run workflow on schedule (every day at 01:00 UTC) and on manual trigger
 on:
   schedule:
     - cron: '0 1 * * *'  # daily at 01:00 UTC
-  workflow_dispatch:      # allows manual trigger
+  workflow_dispatch:
 
 jobs:
   etl:
-    runs-on: ubuntu-latest  # GitHub-hosted Linux runner
+    runs-on: ubuntu-latest
 
     steps:
-      # ---------- Step 1: Checkout repository ----------
-      - name: Checkout repo
+      # Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v3
-        # This checks out your repo so the workflow can access code and lookups
 
-      # ---------- Step 2: Set up Python 3.11 ----------
+      # Set up Python 3.11
       - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      # ---------- Step 3: Install dependencies ----------
+      # Install dependencies
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy requests google-api-python-client google-auth
 
-      # ---------- Step 4: Set environment variables ----------
-      - name: Set environment variables from secrets
-        run: |
-          echo "GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}" >> $GITHUB_ENV
-          echo "GCP_SA_JSON='${{ secrets.GCP_SA_JSON }}'" >> $GITHUB_ENV
-        # Stores secrets as environment variables accessible to Python
-
-      # ---------- Step 5: Run ETL script ----------
+      # Run ETL script with secrets as environment variables
       - name: Run ETL
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
         run: |
           python etl/etl_main.py
-        # Runs your ETL; prints logs including number of rows downloaded,
-        # latest week snapshot, and confirms upload to Google Sheets
