@@ -1,231 +1,257 @@
 # etl/etl_main.py
-# Full ETL script for HM Land Registry Price Paid -> Google Sheets
-# Python 3.11+ recommended
-# This file contains line-by-line comments explaining what each line does.
+# Full ETL script: Land Registry Price Paid -> Google Sheets
+# Uses the official HTTPS hosted CSV to avoid S3 403 problems.
+# Python 3.11+ recommended.
+# All lines include explanatory comments.
 
-# ---------- imports: standard library ----------
-import os                                 # operating system interfaces (env vars, path checks)
-import io                                 # in-memory streams (wrap text for pandas CSV reader)
-import json                               # parse JSON strings (GCP service account JSON)
-from datetime import datetime             # create timestamps for logging
+# ---------- standard library imports ----------
+import os                                # interact with environment variables and file system
+import io                                # create in-memory text streams for pandas CSV reader
+import json                              # parse JSON strings (service account JSON)
+from datetime import datetime            # create timestamps for logs
 
-# ---------- imports: third-party ----------
-import requests                           # perform HTTP requests (API calls and CSV downloads)
-import pandas as pd                       # data manipulation and CSV reading/writing
-import numpy as np                        # numeric utilities (nunique, NaN handling)
+# ---------- third-party imports ----------
+import requests                          # HTTP client for downloads
+import pandas as pd                      # data manipulation, CSV reading/writing
+import numpy as np                       # numeric utilities (nunique, NaN handling)
 
-# google auth and sheets client imports
-from google.oauth2.service_account import Credentials   # build credentials from service account JSON
-from googleapiclient.discovery import build            # construct Google Sheets API service
+# ---------- Google API imports ----------
+from google.oauth2.service_account import Credentials   # create credentials from service account JSON
+from googleapiclient.discovery import build            # build Google Sheets API client
 
-# ---------- CONFIG ----------
-HMLR_API_BASE = "https://use-land-property-data.service.gov.uk/api/v1"  # base URL for HMLR API endpoints
-DATASET_NAME_HINT = "price"  # string hint to find Price Paid dataset among HMLR datasets
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")  # target Google Sheet ID (set as GitHub secret)
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]  # OAuth scopes needed
+# ---------- Configuration ----------
+# Official, stable HTTPS URL for the full Price Paid Data CSV (monthly complete file)
+LAND_REGISTRY_CSV_URL = "https://landregistry.data.gov.uk/app/uploads/pp-complete.csv"  # Hosted by Land Registry
 
-# ---------- HELPER: HMLR API GET ----------
-def hmlr_api_get(path, api_key, params=None):
+# Local uploaded file path present in the conversation history (image). Included per developer instruction.
+# NOTE: this is an image path from the conversation and is not used by the ETL download.
+UPLOADED_FILE_PATH = "/mnt/data/3e7adebc-632c-4a8e-8eb7-ad753a2fb041.png"  # path to uploaded screenshot (for reference)
+
+# Google Sheets target: set this in GitHub secrets as GOOGLE_SHEET_ID
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")  # ID of the Google Sheet to write to (required)
+
+# OAuth scopes required to write to Sheets and access Drive (for clearing tabs)
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+# ---------- Download function ----------
+def download_land_registry():
     """
-    Perform a GET request to the HMLR API.
-    - path: API path (e.g., '/datasets' or '/datasets/{id}/resources')
-    - api_key: HMLR API key from environment/secret
-    - params: optional dict of query parameters
-    Returns parsed JSON on success, raises HTTPError on failure.
+    Download the Land Registry 'pp-complete.csv' from the official HTTPS host and return a pandas DataFrame.
+    This avoids the old S3 URL that returned 403. The function streams and decodes content into pandas.
     """
-    url = HMLR_API_BASE.rstrip('/') + '/' + path.lstrip('/')  # build full endpoint URL
-    headers = {
-        "Accept": "application/json",  # request JSON response
-        "x-api-key": api_key           # include HMLR API key in header per API docs
-    }
-    r = requests.get(url, headers=headers, params=params, timeout=60)  # perform HTTP GET with timeout
-    r.raise_for_status()  # if HTTP response code is not 2xx raise requests.HTTPError
-    return r.json()  # parse and return JSON body
+    # Informational log that download is starting
+    print("Downloading Land Registry CSV from official hosted URL...")
 
-# ---------- HELPER: find the Price Paid dataset ----------
-def find_price_paid_dataset(api_key):
-    """
-    Locate the Price Paid dataset resource using the HMLR API.
-    - api_key: HMLR API key
-    Returns dataset resource dict if found, raises RuntimeError otherwise.
-    """
-    datasets = hmlr_api_get("/datasets", api_key)  # request list of datasets from HMLR
-    # normalize response shape: some endpoints return {'items': [...]}, others a list directly
-    items = datasets.get('items') if isinstance(datasets, dict) and 'items' in datasets else datasets
-    if not items:
-        # no datasets returned -> raise helpful error so operator can debug API key/licence
-        raise RuntimeError("No datasets returned by HMLR API. Check your API key and licence.")
-    candidates = []  # will collect dataset resources that match hint
-    for d in items:
-        # get a searchable title or name (lowercased)
-        title = (d.get('title') or d.get('name') or "").lower()
-        if DATASET_NAME_HINT in title:
-            candidates.append(d)  # add if hint appears in title/name
-    if not candidates:
-        # if nothing matched, raise an error and provide a short diagnostic
-        raise RuntimeError("Price Paid dataset not found via HMLR API. Check dataset list: " + str([d.get('title') for d in items[:10]]))
-    return candidates[0]  # return the first candidate found
+    # Use the official HTTPS URL defined in configuration
+    url = LAND_REGISTRY_CSV_URL  # the stable CSV location on landregistry.data.gov.uk
 
-# ---------- HELPER: resolve secure download link ----------
-def get_secure_download_link(dataset, api_key):
-    """
-    Given a dataset resource dict, try to extract a secure CSV download URL.
-    The dataset structure varies, so we look in common keys and try dataset-specific endpoints.
-    """
-    resources = dataset.get('resources') or dataset.get('files') or []  # common keys for resource listings
-    for r in resources:
-        # common URL keys: 'download', 'url', 'link'
-        url = r.get('download') or r.get('url') or r.get('link')
-        # if this resource looks like the Price Paid CSV (by name/title/url), return it
-        if url and (url.endswith('.csv') or 'pp' in (r.get('name') or '').lower() or 'price' in (r.get('title') or '').lower()):
-            return url
-    # if not found directly, attempt dataset-specific resource endpoints using dataset id/slug
-    ds_id = dataset.get('id') or dataset.get('dataset_id') or dataset.get('slug')  # extract dataset identifier
-    if ds_id:
-        # try two likely endpoint patterns that may return resources or signed links
-        for try_path in (f"/datasets/{ds_id}/download", f"/datasets/{ds_id}/resources"):
-            try:
-                resp = hmlr_api_get(try_path, api_key)  # call the dataset-specific endpoint
-                if isinstance(resp, dict):
-                    # look for any string value that is a CSV URL among the response values
-                    for v in resp.values():
-                        if isinstance(v, str) and v.startswith('http') and '.csv' in v:
-                            return v
-                    # if resp contains 'items', inspect each item for CSV URLs
-                    if 'items' in resp and isinstance(resp['items'], list):
-                        for item in resp['items']:
-                            url = item.get('download') or item.get('url') or item.get('link')
-                            if url and url.endswith('.csv'):
-                                return url
-            except Exception:
-                # ignore errors here; continue trying other paths
-                continue
-    # if no download link could be resolved, raise an informative error (slice dataset JSON for brevity)
-    raise RuntimeError("Could not resolve a secure download URL for the Price Paid dataset automatically. Inspect the dataset object: " + json.dumps(dataset)[:2000])
+    # Perform HTTP GET with a generous timeout for large file download
+    r = requests.get(url, timeout=300)  # stream=False by default; content read below
+    # Raise an exception if the HTTP status is not 200 OK (or other 2xx)
+    r.raise_for_status()
 
-# ---------- DOWNLOAD CSV from resolved URL ----------
-def download_csv_from_url(url):
-    """
-    Download a CSV from the given URL and return it as a pandas DataFrame.
-    Uses streaming and decodes content as UTF-8.
-    """
-    r = requests.get(url, stream=True, timeout=300)  # stream download with larger timeout for big files
-    r.raise_for_status()  # raise HTTPError if status not OK
-    text = r.content.decode('utf-8')  # decode bytes to text assuming UTF-8 encoding
-    df = pd.read_csv(io.StringIO(text), low_memory=False)  # parse CSV text to pandas DataFrame
-    return df  # return parsed DataFrame
+    # Decode bytes to text assuming UTF-8 (Land Registry CSV is UTF-8)
+    text = r.content.decode("utf-8")
 
-# ---------- TRANSFORMATION: prepare transactions ----------
+    # Wrap the CSV text in an in-memory text stream and parse it with pandas
+    df = pd.read_csv(io.StringIO(text), low_memory=False)
+
+    # Log the number of rows downloaded for visibility in CI logs
+    print(f"✅ Downloaded {len(df):,} rows from Land Registry CSV at {url}")
+
+    # Return the parsed DataFrame to the caller
+    return df
+
+# ---------- Transformation helpers ----------
 def prepare_transactions(df_raw, postcode_lookup_path=None):
     """
-    Clean raw Price Paid DataFrame and aggregate to weekly counts by Local Authority.
-    - df_raw: pandas DataFrame loaded from PPD CSV
-    - postcode_lookup_path: optional path to postcode->LA lookup CSV
-    Returns weekly aggregated DataFrame with columns: week, local_authority, transactions
+    Clean the raw Price Paid DataFrame and aggregate to weekly per Local Authority.
+    - df_raw: pandas DataFrame loaded from the CSV
+    - postcode_lookup_path: optional CSV path mapping postcode -> local_authority
+    Returns a DataFrame with columns: week (datetime), local_authority, transactions
     """
-    df = df_raw.copy()  # copy input to avoid side-effects on original variable
-    date_col = next((c for c in df.columns if 'date' in c.lower()), None)  # find first column that contains 'date'
-    if date_col is None:
-        raise RuntimeError("No date column in PPD CSV.")  # cannot proceed without date
-    df['date'] = pd.to_datetime(df[date_col], errors='coerce')  # parse dates, invalid->NaT
-    df = df.dropna(subset=['date'])  # drop rows where date parsing failed
-    id_col = next((c for c in df.columns if 'unique' in c.lower() or c.lower()=='transactionuniqueidentifier'), None)  # attempt to find unique id
-    if id_col:
-        df['transaction_id'] = df[id_col]  # copy existing unique identifier into a standard column
-    else:
-        df['transaction_id'] = np.arange(len(df))  # create synthetic transaction ids using row numbers
-    pc_col = next((c for c in df.columns if 'postcode' in c.lower()), None)  # find postcode column if present
-    if pc_col:
-        df['postcode'] = df[pc_col].astype(str).str.replace(r'\s+','',regex=True).str.upper()  # normalize postcode: remove spaces, uppercase
-    else:
-        df['postcode'] = None  # set postcode column to None if not available
-    if postcode_lookup_path and os.path.exists(postcode_lookup_path):
-        la = pd.read_csv(postcode_lookup_path, dtype=str)  # load postcode->LA lookup mapping
-        la['pc_nospace'] = la['postcode'].astype(str).str.replace(r'\s+','',regex=True).str.upper()  # normalize lookup postcodes
-        df = df.merge(la[['pc_nospace','local_authority']], left_on='postcode', right_on='pc_nospace', how='left')  # merge LA codes/names
-    else:
-        df['local_authority'] = df['postcode'].str[:4]  # fallback: use first 4 chars of postcode as rough bucket when no lookup available
-    df['week'] = df['date'].dt.to_period('W').apply(lambda r: r.start_time)  # compute week-start timestamp for each transaction
-    weekly = df.groupby(['week','local_authority']).agg(transactions=('transaction_id','nunique')).reset_index()  # aggregate weekly unique transaction counts by LA
-    weekly = weekly.sort_values(['local_authority','week'])  # sort results for consistent ordering
-    return weekly  # return the weekly aggregation DataFrame
+    # Copy input to avoid mutating caller's object
+    df = df_raw.copy()
 
-# ---------- TRANSFORMATION: compute rolling windows ----------
-def compute_rolling_windows(weekly_df, windows=[4,12]):
+    # Find a column that contains 'date' in its name (e.g., 'date_of_transfer')
+    date_col = next((c for c in df.columns if 'date' in c.lower()), None)
+    if date_col is None:
+        # If no date column found, abort with helpful message
+        raise RuntimeError("No date column in Price Paid CSV. Cannot continue ETL.")
+
+    # Parse the date column into pandas datetime; invalid parse becomes NaT
+    df['date'] = pd.to_datetime(df[date_col], errors='coerce')
+
+    # Drop rows that failed to parse into a date
+    df = df.dropna(subset=['date'])
+
+    # Attempt to detect an existing unique transaction identifier column; otherwise create one
+    id_col = next((c for c in df.columns if 'unique' in c.lower() or c.lower() == 'transactionuniqueidentifier'), None)
+    if id_col:
+        # Use the vendor-supplied unique id if available
+        df['transaction_id'] = df[id_col]
+    else:
+        # Create a synthetic unique id using the row index if none exists
+        df['transaction_id'] = np.arange(len(df))
+
+    # Normalize postcode field if present: remove whitespace and uppercase
+    pc_col = next((c for c in df.columns if 'postcode' in c.lower()), None)
+    if pc_col:
+        # Remove spaces and uppercase to create normalized postcodes
+        df['postcode'] = df[pc_col].astype(str).str.replace(r'\s+', '', regex=True).str.upper()
+    else:
+        # Ensure postcode column exists even if source lacks it
+        df['postcode'] = None
+
+    # If a postcode->local_authority lookup is available, use it for accurate mapping
+    if postcode_lookup_path and os.path.exists(postcode_lookup_path):
+        # Read the lookup file (expects 'postcode' and 'local_authority' columns)
+        la = pd.read_csv(postcode_lookup_path, dtype=str)
+        # Normalize lookup postcodes to the same no-space uppercase format
+        la['pc_nospace'] = la['postcode'].astype(str).str.replace(r'\s+', '', regex=True).str.upper()
+        # Merge the lookup into the main dataframe to obtain 'local_authority'
+        df = df.merge(la[['pc_nospace', 'local_authority']], left_on='postcode', right_on='pc_nospace', how='left')
+    else:
+        # Fallback: use the first 4 characters of postcode as a rough proxy bucket (not precise)
+        df['local_authority'] = df['postcode'].str[:4]
+
+    # Compute the week-start timestamp for each transaction (use period start)
+    df['week'] = df['date'].dt.to_period('W').apply(lambda r: r.start_time)
+
+    # Aggregate to weekly unique transaction counts per local authority
+    weekly = df.groupby(['week', 'local_authority']).agg(transactions=('transaction_id', 'nunique')).reset_index()
+
+    # Sort the result for deterministic order
+    weekly = weekly.sort_values(['local_authority', 'week'])
+
+    # Return the aggregated weekly DataFrame
+    return weekly
+
+def compute_rolling_windows(weekly_df, windows=[4, 12]):
     """
-    Compute rolling window sums (e.g., 4-week, 12-week) per Local Authority.
+    For each requested window size, compute the rolling sum of transactions per Local Authority.
     Returns a concatenated DataFrame with columns: week, local_authority, rolling_trans, transactions, window_weeks
     """
-    weekly_df['week'] = pd.to_datetime(weekly_df['week'])  # ensure week is datetime dtype
-    outputs = []  # list accumulator for per-window DataFrames
-    las = weekly_df['local_authority'].dropna().unique()  # get unique LAs present in data
-    all_weeks = pd.date_range(weekly_df['week'].min(), weekly_df['week'].max(), freq='W-MON')  # construct continuous week range
-    full_idx = pd.MultiIndex.from_product([all_weeks, las], names=['week','local_authority'])  # create complete week x LA grid
-    full_df = pd.DataFrame(index=full_idx).reset_index()  # turn grid into DataFrame
-    merged = full_df.merge(weekly_df, on=['week','local_authority'], how='left').fillna(0)  # merge actual data and fill missing with 0
-    merged = merged.sort_values(['local_authority','week'])  # sort to ensure rolling computation correctness
-    for w in windows:
-        m = merged.copy()  # copy merged grid for this window size
-        # compute rolling sum per local_authority, using min_periods=1 to avoid NaN at start of series
-        m['rolling_trans'] = m.groupby('local_authority')['transactions'].transform(lambda s: s.rolling(w, min_periods=1).sum())
-        m['window_weeks'] = w  # annotate which window this row represents
-        outputs.append(m[['week','local_authority','rolling_trans','transactions','window_weeks']])  # select output columns
-    return pd.concat(outputs, ignore_index=True)  # concatenate per-window DataFrames into one long table
+    # Ensure the 'week' column is datetime for constructing ranges and rolling calculations
+    weekly_df['week'] = pd.to_datetime(weekly_df['week'])
 
-# ---------- WRITE TO GOOGLE SHEETS ----------
+    # Prepare an accumulator list for each window-sized DataFrame
+    outputs = []
+
+    # Unique list of Local Authorities present in the data
+    las = weekly_df['local_authority'].dropna().unique()
+
+    # Build a continuous list of week-start dates covering the whole range of data
+    all_weeks = pd.date_range(weekly_df['week'].min(), weekly_df['week'].max(), freq='W-MON')
+
+    # Create a full cartesian product index of all weeks x all LAs so we have rows for missing weeks
+    full_idx = pd.MultiIndex.from_product([all_weeks, las], names=['week', 'local_authority'])
+    full_df = pd.DataFrame(index=full_idx).reset_index()
+
+    # Merge the actual weekly data onto the full grid and fill missing transaction counts with 0
+    merged = full_df.merge(weekly_df, on=['week', 'local_authority'], how='left').fillna(0)
+
+    # Ensure correct sort order for groupby+rolling
+    merged = merged.sort_values(['local_authority', 'week'])
+
+    # For each requested window size compute rolling sums
+    for w in windows:
+        # Make a working copy for this window
+        m = merged.copy()
+        # Compute rolling sum per local_authority with min_periods=1 to avoid NaNs at series start
+        m['rolling_trans'] = m.groupby('local_authority')['transactions'].transform(lambda s: s.rolling(w, min_periods=1).sum())
+        # Annotate which window this row represents
+        m['window_weeks'] = w
+        # Select the output columns and add to outputs list
+        outputs.append(m[['week', 'local_authority', 'rolling_trans', 'transactions', 'window_weeks']])
+
+    # Concatenate the per-window results into a single long DataFrame and return
+    return pd.concat(outputs, ignore_index=True)
+
+# ---------- Google Sheets writer ----------
 def write_to_google_sheets(dfs_by_tab, gcp_service_account_json):
     """
-    Write a dictionary of DataFrames to the specified Google Sheet.
-    - dfs_by_tab: mapping of sheet tab names to pandas DataFrames
-    - gcp_service_account_json: parsed JSON dict of GCP service account credentials
+    Write provided DataFrames (dict of tab_name -> DataFrame) to the configured Google Sheet.
+    - dfs_by_tab: dict mapping sheet tab name -> pandas DataFrame
+    - gcp_service_account_json: parsed JSON dict of service account credentials
     """
-    creds = Credentials.from_service_account_info(gcp_service_account_json, scopes=SCOPES)  # create credentials for Sheets API
-    service = build('sheets', 'v4', credentials=creds)  # build Sheets API service client
-    sheet = service.spreadsheets()  # reference to spreadsheets resource
-    for tab, df in dfs_by_tab.items():  # iterate through each tab name and DataFrame
-        values = [df.columns.tolist()] + df.replace({np.nan: ''}).astype(str).values.tolist()  # prepare header row + data rows for upload
-        body = {"values": values}  # body payload for Sheets update
-        range_name = f"{tab}!A1"  # target range starts at A1 for the given tab
-        sheet.values().clear(spreadsheetId=GOOGLE_SHEET_ID, range=tab).execute()  # clear existing content of the tab first
-        sheet.values().update(spreadsheetId=GOOGLE_SHEET_ID, range=range_name, valueInputOption='RAW', body=body).execute()  # write new values
+    # Create Credentials object from the parsed service account JSON
+    creds = Credentials.from_service_account_info(gcp_service_account_json, scopes=SCOPES)
 
-# ---------- MAIN ETL FLOW ----------
+    # Build the Sheets API service object
+    service = build('sheets', 'v4', credentials=creds)
+
+    # Shortcut to the spreadsheets() resource
+    sheet = service.spreadsheets()
+
+    # Iterate over each tab and write it
+    for tab, df in dfs_by_tab.items():
+        # Prepare values: header row followed by data rows (convert NaN to empty string)
+        values = [df.columns.tolist()] + df.replace({np.nan: ''}).astype(str).values.tolist()
+
+        # Body payload for Sheets API update
+        body = {"values": values}
+
+        # Target range: start at A1 on the given tab
+        range_name = f"{tab}!A1"
+
+        # Clear the target tab first to remove leftover rows (prevents old data persisting)
+        sheet.values().clear(spreadsheetId=GOOGLE_SHEET_ID, range=tab).execute()
+
+        # Update the sheet with the new values
+        sheet.values().update(spreadsheetId=GOOGLE_SHEET_ID, range=range_name, valueInputOption='RAW', body=body).execute()
+
+# ---------- Main ETL flow ----------
 def main():
-    run_ts = datetime.utcnow().isoformat()  # capture current UTC timestamp as ISO string
-    print("ETL start", run_ts)  # log start time to console
+    """
+    Main ETL entrypoint:
+    - downloads the full Price Paid CSV from Land Registry
+    - aggregates weekly transactions by LA
+    - computes 4-week and 12-week rolling windows
+    - writes results to Google Sheets
+    """
+    # Capture run timestamp for logs
+    run_ts = datetime.utcnow().isoformat()
+    print("ETL start", run_ts)
 
-    api_key = os.environ.get('HMLR_API_KEY')  # fetch HM Land Registry API key from environment (GitHub secret)
-    if not api_key:
-        raise RuntimeError("HMLR_API_KEY missing. Set it in repository secrets.")  # error out if API key is not provided
+    # 1) Download the Land Registry CSV into a pandas DataFrame
+    print("Downloading Land Registry CSV...")
+    df_raw = download_land_registry()  # call the download function above (will raise on any HTTP error)
 
-    dataset = find_price_paid_dataset(api_key)  # discover Price Paid dataset resource using HMLR API
-    print("Found dataset:", dataset.get('title') or dataset.get('name') or dataset.get('id'))  # log dataset identifier for debugging
+    # 2) Transform raw CSV -> weekly transactions by Local Authority
+    # Use a postcode->LA lookup if present at lookups/uk_postcode_to_la.csv (optional)
+    postcode_lookup = "lookups/uk_postcode_to_la.csv" if os.path.exists("lookups/uk_postcode_to_la.csv") else None
+    weekly = prepare_transactions(df_raw, postcode_lookup_path=postcode_lookup)
 
-    secure_url = get_secure_download_link(dataset, api_key)  # resolve secure signed download URL for CSV
-    print("Resolved secure download URL (first 200 chars):", str(secure_url)[:200])  # log a substring of the URL so logs don't leak entire link
+    # 3) Compute rolling windows (4-week and 12-week by default)
+    windows_df = compute_rolling_windows(weekly, windows=[4, 12])
 
-    df_raw = download_csv_from_url(secure_url)  # download CSV from resolved secure URL and parse into DataFrame
-    print("Downloaded CSV rows:", len(df_raw))  # log how many rows were downloaded
+    # 4) Prepare 'latest' snapshot - rows matching the most recent week in the windows_df
+    latest = windows_df[windows_df['week'] == windows_df['week'].max()].copy()
 
-    # transform: compute weekly transactions by local authority (use postcode lookup if available in repo under lookups/)
-    weekly = prepare_transactions(df_raw, postcode_lookup_path="lookups/uk_postcode_to_la.csv" if os.path.exists("lookups/uk_postcode_to_la.csv") else None)
-
-    windows_df = compute_rolling_windows(weekly, windows=[4,12])  # compute rolling windows for 4-week and 12-week windows
-
-    latest = windows_df[windows_df['week'] == windows_df['week'].max()].copy()  # prepare a snapshot of the most recent week
-
-    gcp_sa_text = os.environ.get('GCP_SA_JSON')  # retrieve GCP service account JSON text from environment (GitHub secret)
+    # 5) Load GCP service account JSON from environment (GitHub secret must set this)
+    gcp_sa_text = os.environ.get('GCP_SA_JSON')
     if not gcp_sa_text:
-        raise RuntimeError("GCP_SA_JSON missing. Set it as GitHub secret with the contents of your service account JSON.")  # error if not set
-    gcp_json = json.loads(gcp_sa_text)  # parse JSON string into Python dict
+        # If GCP_SA_JSON is missing, raise with a helpful message
+        raise RuntimeError("GCP_SA_JSON missing. Set it as a GitHub repository secret containing the full service account JSON text.")
+    # Parse the JSON text into a Python dict
+    gcp_json = json.loads(gcp_sa_text)
 
+    # 6) Validate Google Sheet ID is set
+    if not GOOGLE_SHEET_ID:
+        # Helpful error if the sheet ID isn't configured
+        raise RuntimeError("GOOGLE_SHEET_ID environment variable is not set. Add it to GitHub secrets or environment variables.")
+
+    # 7) Write the computed DataFrames to Google Sheets tabs
     write_to_google_sheets({
-        "weekly_by_la": weekly,   # tab with weekly transaction counts by LA
-        "windows": windows_df,    # tab with rolling window aggregates (4wk/12wk)
-        "latest": latest          # tab with latest snapshot per LA
-    }, gcp_json)  # write all tabs to the target Google Sheet using provided service account JSON
+        "weekly_by_la": weekly,    # weekly counts by local authority
+        "windows": windows_df,     # rolling windows table (4wk/12wk)
+        "latest": latest           # latest snapshot per LA
+    }, gcp_json)
 
-    print("ETL finished", datetime.utcnow().isoformat())  # log completion time
+    # 8) Log completion timestamp
+    print("ETL finished", datetime.utcnow().isoformat())
 
+# Run main when executed as a script
 if __name__ == "__main__":
-    main()  # run main when executed as a script
+    main()
