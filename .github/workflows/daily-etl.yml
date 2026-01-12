@@ -4,6 +4,9 @@
 # - Passes multi-line GCP_SA_JSON via env (do NOT use echo >> $GITHUB_ENV for multi-line secrets)
 # - Installs dependencies and runs etl/etl_main.py
 
+
+'''
+
 name: Daily Land Registry ETL
 
 on:
@@ -43,3 +46,5 @@ jobs:
         run: |
           # Increase default timeout for Python if needed (the runner step itself has a default 6 hour job timeout)
           python etl/etl_main.py
+
+'''
